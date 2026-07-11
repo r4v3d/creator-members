@@ -1,0 +1,2667 @@
+"""
+Aceptador de Invitaciones TIDAL Family - Automatización por fases
+
+Fases:
+    1. Crear perfiles virtuales para cada invitación
+    2. Abrir UN SOLO Chrome + contextos aislados para cada link
+    3. Detectar email en página y buscar contraseña correspondiente
+    4. Rellenar email y contraseña en formulario de login
+    5. Iniciar sesión y aceptar la invitación
+    6. Verificar que la invitación fue aceptada correctamente
+
+Características:
+    - UN SOLO Chrome con contextos aislados (equivalente a incógnito)
+    - Cada invitación en su propia ventana privada (cookies, almacenamiento separados)
+    - Detección automática de email en la página (links desordenados OK)
+    - Emparejamiento inteligente de email-contraseña
+    - Procesamiento por BLOQUES de 15 (para links que expiran rápido)
+    - Detección de antibot/captcha (pausa manual para resolución)
+
+Archivos requeridos:
+    invitaciones.txt     - Links de invitación TIDAL Family (uno por línea, desordenados OK)
+    emails.txt           - Emails para login (uno por línea)
+    passwords.txt        - Contraseñas (una por línea, orden correspondiente a emails.txt)
+
+Importante:
+    Cada invitación se procesa en una ventana privada diferente.
+    No se puede aceptar 2 invitaciones en la misma ventana.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+import time
+import random
+import human_slider
+from pathlib import Path
+from typing import Any
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Error as PWError
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_INVITACIONES_FILE = SCRIPT_DIR / "invitaciones.txt"
+DEFAULT_CUENTAS_FILE = SCRIPT_DIR / "cuentastidal.txt"
+PROFILES_DIR = SCRIPT_DIR / "chrome_profiles"
+
+
+def pausa_manual(subtitulo: str, segundos_sin_tty: float = 90.0) -> None:
+    """Detiene el script hasta Enter (o espera fija si no hay consola interactiva)."""
+    bar = "=" * 62
+    print(f"\n{bar}\n  PAUSA MANUAL — {subtitulo}\n{bar}")
+    print(
+        "  El script queda detenido. Resuelve captchas/antibot en las ventanas.\n"
+        "  Cuando esté todo listo, vuelve a ESTA ventana y pulsa Enter para seguir.\n"
+    )
+    try:
+        if sys.stdin.isatty():
+            input("  >>> Pulsa Enter para continuar el script <<<  ")
+        else:
+            print(f"  (Sin TTY: esperando {segundos_sin_tty:.0f}s y continuando…)\n")
+            time.sleep(segundos_sin_tty)
+    except EOFError:
+        time.sleep(segundos_sin_tty)
+
+
+def detectar_antibot_tid(page) -> bool:
+    """Detecta pantalla de verificación humana / antibot de TIDAL."""
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    # Verificar que exista un frame con URL de captcha-delivery
+    has_captcha_frame = False
+    for frame in frames_visibles(page):
+        try:
+            url = frame.url.lower()
+            if "captcha-delivery" in url:
+                has_captcha_frame = True
+                break
+        except:
+            continue
+    if not has_captcha_frame:
+        return False
+
+    patrones = (
+        re.compile(r"nos\s+aseguramos\s+de\s+que", re.I),
+        re.compile(r"no\s+a\s+un\s+robot", re.I),
+        re.compile(r"desliza\s+hacia\s+la\s+derecha", re.I),
+        re.compile(r"velocidad\s+sobrehumana", re.I),
+        re.compile(r"making\s+sure.*robot", re.I),
+        re.compile(r"not\s+a\s+robot", re.I),
+        re.compile(r"slide\s+to\s+(the\s+)?right", re.I),
+        re.compile(r"superhuman\s+speed", re.I),
+        re.compile(r"soy\s+humano", re.I),
+        re.compile(r"i['']?m\s+human", re.I),
+    )
+
+    for frame in frames_visibles(page):
+        # Solo verificar frames que sean de captcha-delivery
+        try:
+            if "captcha-delivery" not in frame.url.lower():
+                continue
+        except:
+            continue
+
+        for pat in patrones:
+            try:
+                loc = frame.get_by_text(pat)
+                if loc.count() == 0:
+                    continue
+                if loc.first.is_visible(timeout=700):
+                    return True
+            except PWTimeout:
+                continue
+            except PWError:
+                return False
+            except Exception:
+                continue
+    return False
+
+
+def detectar_error_403_cloudfront(page) -> bool:
+    """Detecta página 403 de CloudFront ('Request blocked')."""
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    try:
+        titulo = page.title()
+        if re.search(r"403|request could not be satisfied", titulo, re.I):
+            return True
+    except Exception:
+        pass
+
+    patrones = (
+        re.compile(r"403\s*ERROR", re.I),
+        re.compile(r"the request could not be satisfied", re.I),
+        re.compile(r"request blocked", re.I),
+        re.compile(r"generated by cloudfront", re.I),
+        re.compile(r"we can'?t connect to the server", re.I),
+        re.compile(r"demasiado tr[aá]fico", re.I),
+        re.compile(r"error 403", re.I),
+        re.compile(r"access denied", re.I),
+    )
+
+    for frame in frames_visibles(page):
+        for pat in patrones:
+            try:
+                loc = frame.get_by_text(pat)
+                if loc.count() == 0:
+                    continue
+                if loc.first.is_visible(timeout=700):
+                    return True
+            except PWTimeout:
+                continue
+            except PWError:
+                return False
+            except Exception:
+                continue
+
+        try:
+            txt = frame.locator("body").inner_text(timeout=1500)
+            if re.search(r"403\s*ERROR|generated by cloudfront|request blocked|access denied", txt, re.I):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def detectar_captcha_caducado(page) -> bool:
+    """Detecta si el captcha de la página ha caducado y necesita recargarse."""
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    # Verificar que exista un frame con URL de captcha-delivery
+    has_captcha_frame = False
+    for frame in frames_visibles(page):
+        try:
+            url = frame.url.lower()
+            if "captcha-delivery" in url:
+                has_captcha_frame = True
+                break
+        except:
+            continue
+    if not has_captcha_frame:
+        return False
+
+    patrones = (
+        re.compile(r"caduc[aó]", re.I),
+        re.compile(r"expired", re.I),
+        re.compile(r"vuelve\s+a\s+cargar", re.I),
+        re.compile(r"reload\s+the\s+page", re.I),
+        re.compile(r"recargar", re.I),
+        re.compile(r"refrescar", re.I),
+        re.compile(r"reintentar", re.I),
+        re.compile(r"retry", re.I),
+        re.compile(r"sin\s+acceso\s+a\s+internet", re.I),
+        re.compile(r"offline", re.I),
+    )
+
+    for frame in frames_visibles(page):
+        # Solo verificar frames que sean de captcha-delivery
+        try:
+            if "captcha-delivery" not in frame.url.lower():
+                continue
+        except:
+            continue
+
+        # 1. Comprobar por texto
+        for pat in patrones:
+            try:
+                loc = frame.get_by_text(pat)
+                if loc.count() > 0 and loc.first.is_visible(timeout=400):
+                    return True
+            except PWTimeout:
+                continue
+            except Exception:
+                continue
+                
+        # 2. Comprobar selectores específicos de botones de reintento/offline de DataDome
+        selectores_error = [
+            "#captcha_reload_button",
+            ".retryLink",
+            "#captcha_offline",
+            "[class*='retry' i]",
+            "[id*='offline' i]"
+        ]
+        for sel in selectores_error:
+            try:
+                loc = frame.locator(sel)
+                if loc.count() > 0 and loc.first.is_visible(timeout=400):
+                    return True
+            except PWTimeout:
+                continue
+            except Exception:
+                continue
+                
+    return False
+
+
+def resolver_slider_captcha_single(page) -> bool:
+    """Intenta detectar y deslizar el slider de verificación humana en la página."""
+    try:
+        page.bring_to_front()
+        time.sleep(0.35)
+    except Exception:
+        pass
+
+    # 1. Esperar hasta 4.0 segundos a que cargue la interfaz del captcha en algún frame
+    start_wait = time.monotonic()
+    target_frame = None
+    captcha_data = None
+    
+    js_finder = """
+    () => {
+        // Buscar el elemento handle del slider
+        const handle = document.querySelector(".slider") || document.querySelector(".slider-button") || document.querySelector(".captcha_verify_slide_button") || document.querySelector("[class*='thumb' i]") || document.querySelector("[class*='handle' i]");
+        if (!handle) return null;
+        
+        // Buscar el contenedor de la pista (track)
+        const track = document.querySelector(".sliderContainer") || document.querySelector(".sliderbg") || document.querySelector(".sliderText") || handle.parentElement;
+        if (!track) return null;
+        
+        const rHandle = handle.getBoundingClientRect();
+        const rTrack = track.getBoundingClientRect();
+        
+        // Validar dimensiones lógicas para evitar falsos positivos
+        if (rHandle.width >= 20 && rHandle.width <= 100 && rTrack.width >= 150 && rTrack.width <= 450) {
+            return {
+                handleX: rHandle.left,
+                handleY: rHandle.top,
+                handleW: rHandle.width,
+                handleH: rHandle.height,
+                trackW: rTrack.width
+            };
+        }
+        return null;
+    }
+    """
+    
+    while time.monotonic() - start_wait < 4.0:
+        for frame in frames_visibles(page):
+            try:
+                # Comprobar si podemos encontrar datos de captcha en este frame
+                data = frame.evaluate(js_finder)
+                if data:
+                    target_frame = frame
+                    captcha_data = data
+                    break
+            except Exception:
+                continue
+        if captcha_data:
+            break
+        time.sleep(0.25)
+
+    # Diagnóstico detallado en consola si no se detectó nada
+    if not captcha_data or not target_frame:
+        print("    [Anti-bot Auto Debug] No se pudo encontrar el captcha en ningún frame. Ejecutando diagnóstico de frames:")
+        for idx, f in enumerate(frames_visibles(page)):
+            try:
+                print(f"      Frame [{idx}] URL: {f.url}")
+                # Ejecutar un escaneo completo de elementos de la interfaz dentro de los contenedores
+                deep_elements = f.evaluate("""
+                () => {
+                    const root = document.getElementById("ddv1-captcha-container") || document.getElementById("captcha-container") || document.body;
+                    if (!root) return [];
+                    const els = Array.from(root.querySelectorAll("*"));
+                    return els.map(el => {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            tag: el.tagName,
+                            id: el.id,
+                            class: el.className,
+                            text: el.innerText ? el.innerText.trim().substring(0, 30) : "",
+                            w: rect.width,
+                            h: rect.height,
+                            x: rect.left,
+                            y: rect.top
+                        };
+                    }).filter(e => e.w > 0 && e.h > 0).slice(0, 40);
+                }
+                """)
+                print(f"      Frame [{idx}] Elementos Visibles: {deep_elements}")
+            except Exception as e_diag:
+                print(f"      Frame [{idx}] Error de diagnóstico: {e_diag}")
+        return False
+
+    try:
+        # 2. Hacer scroll de los contenedores para asegurar visibilidad en el viewport
+        try:
+            iframe_handle = target_frame.frame_element()
+            if iframe_handle:
+                iframe_handle.scroll_into_view_if_needed()
+                
+            # Scroll del handle dentro del iframe
+            target_frame.evaluate("""
+            () => {
+                const handle = document.querySelector(".slider") || document.querySelector(".slider-button") || document.querySelector(".captcha_verify_slide_button") || document.querySelector("[class*='thumb' i]") || document.querySelector("[class*='handle' i]");
+                if (handle) {
+                    handle.scrollIntoView({block: "center", inline: "center"});
+                }
+            }
+            """)
+            time.sleep(0.2)  # Pausa para que el scroll se complete
+            
+            # Re-evaluar los datos para obtener las coordenadas físicas correctas post-scroll
+            captcha_data = target_frame.evaluate(js_finder)
+        except Exception as e_scroll:
+            print(f"    [Anti-bot Auto Debug] Aviso scroll-into-view: {e_scroll}")
+
+        if not captcha_data:
+            print("    [Anti-bot Auto Debug] Error: No se pudieron re-evaluar las coordenadas del captcha post-scroll.")
+            return False
+
+        iframe_handle = target_frame.frame_element()
+        iframe_box = iframe_handle.bounding_box()
+        if not iframe_box:
+            print("    [Anti-bot Auto Debug] Error: No se pudo obtener el bounding box del iframe.")
+            return False
+            
+        # Calcular coordenadas absolutas de inicio (centro del handle) en el viewport de la página principal
+        start_x = iframe_box["x"] + captcha_data["handleX"] + captcha_data["handleW"] / 2
+        start_y = iframe_box["y"] + captcha_data["handleY"] + captcha_data["handleH"] / 2
+        
+        # Calcular la distancia del arrastre
+        width_track = captcha_data["trackW"]
+        distance = width_track - captcha_data["handleW"]
+        if distance <= 0:
+            distance = 240
+            
+        print(f"    [Anti-bot Auto Debug] Captcha encontrado en frame: {target_frame.url}")
+        print(f"    [Anti-bot Auto Debug] Ejecutando arrastre: distancia = {distance}px (pista: {width_track}px, handle: {captcha_data['handleW']}px)")
+        print(f"    [Anti-bot Auto Debug] Coordenadas de inicio mouse: ({start_x:.1f}, {start_y:.1f})")
+
+        # 3. Mover el mouse a las coordenadas y arrastrar
+        page.mouse.move(start_x, start_y)
+        page.mouse.down()
+        time.sleep(random.uniform(0.18, 0.35))
+        
+        # Dividir el recorrido en 3 segmentos para simular aceleración, velocidad y desaceleración
+        pasos_totales = []
+        
+        # Segmento 1: Aceleración (0% a 30%)
+        seg1_pasos = random.randint(6, 10)
+        for i in range(1, seg1_pasos + 1):
+            ratio = (i / seg1_pasos) * 0.30
+            pasos_totales.append(ratio)
+            
+        # Segmento 2: Velocidad constante/alta (30% a 85%)
+        seg2_pasos = random.randint(12, 18)
+        for i in range(1, seg2_pasos + 1):
+            ratio = 0.30 + (i / seg2_pasos) * 0.55
+            pasos_totales.append(ratio)
+            
+        # Segmento 3: Desaceleración y acople (85% a 100%)
+        seg3_pasos = random.randint(8, 12)
+        for i in range(1, seg3_pasos + 1):
+            ratio = 0.85 + (i / seg3_pasos) * 0.15
+            pasos_totales.append(ratio)
+
+        # Ejecutar el arrastre a lo largo de los pasos calculados
+        distancia_total = distance + random.uniform(8.0, 16.0)
+
+        for ratio in pasos_totales:
+            target_step_x = start_x + (distancia_total * ratio)
+            # Pequeña variación de ruido vertical (Y)
+            target_step_y = start_y + random.uniform(-1.2, 1.2)
+            
+            # Movimiento del mouse
+            page.mouse.move(target_step_x, target_step_y)
+            
+            # Retraso entre pasos: simula respuesta biológica
+            time.sleep(random.uniform(0.012, 0.022))
+
+        # Espera al final del arrastre manteniendo pulsado (asentamiento)
+        time.sleep(random.uniform(0.2, 0.35))
+
+        # Wobble de asentamiento: un leve retroceso y vuelta al extremo derecho para consolidar
+        wobble_x = start_x + distancia_total - random.uniform(2.0, 4.0)
+        page.mouse.move(wobble_x, start_y + random.uniform(-0.5, 0.5))
+        time.sleep(random.uniform(0.04, 0.08))
+        page.mouse.move(start_x + distancia_total, start_y)
+        time.sleep(random.uniform(0.2, 0.35))
+
+        # Soltar el mouse
+        page.mouse.up()
+        return True
+    except Exception as e:
+        print(f"    [Anti-bot Auto Debug] Error durante la simulación de arrastre: {e}")
+        try:
+            page.mouse.up()
+        except Exception:
+            pass
+        return False
+
+
+def detectar_bloqueo_tid(page) -> str | None:
+    """Retorna tipo de bloqueo detectado o None si está OK."""
+    # Si el enlace ya fue aceptado o caducó, no lo consideramos un bloqueo de seguridad
+    if es_invitacion_ya_aceptada(page):
+        return None
+
+    # 1. Comprobar error 403 CloudFront (debe detenerse inmediatamente)
+    if detectar_error_403_cloudfront(page):
+        return "403 CloudFront"
+        
+    # 2. Comprobar captcha / verificación humana o caducado
+    if detectar_antibot_tid(page) or detectar_captcha_caducado(page):
+        print(f"\n   [Antibot] Captcha detectado en la página. Intentando resolver automáticamente...")
+        
+        # Verificar si ha caducado antes de intentar resolver
+        if detectar_captcha_caducado(page):
+            print(f"   [Antibot] Captcha caducado. Recargando ventana...")
+            try:
+                page.reload(wait_until="commit", timeout=40000)
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+        for intento in range(3):
+            print(f"   [Antibot] Intento {intento + 1} de resolución...")
+            if resolver_slider_captcha_single(page):
+                time.sleep(2.0)
+                # Si sigue apareciendo captcha, verificar si es que caducó justo al resolver
+                if detectar_antibot_tid(page):
+                    if detectar_captcha_caducado(page):
+                        print(f"   [Antibot] Captcha caducó tras resolver. Recargando...")
+                        try:
+                            page.reload(wait_until="commit", timeout=40000)
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        continue
+                else:
+                    print("   [Antibot] ✓ Captcha resuelto exitosamente de forma automática")
+                    return None
+            time.sleep(1.5)
+        
+        if detectar_antibot_tid(page):
+            print("   [Antibot] ❌ No se pudo resolver automáticamente tras varios intentos. Requiere pausa manual.")
+            return "antibot"
+            
+    return None
+
+
+def chequear_y_resolver_bloqueos_pagina(page, perfil: str = "Ventana") -> None:
+    """
+    Comprueba si la página actual tiene un bloqueo y actúa:
+    - Si es CloudFront: Detiene el script inmediatamente con pausa manual.
+    - Si es Antibot: Intenta resolverlo con resolver_slider_captcha_single. Si no puede, hace pausa manual.
+    """
+    tipo = detectar_bloqueo_tid(page)
+    if tipo == "403 CloudFront":
+        print(f"\n============================================================")
+        print(f"  ERROR 403 CLOUDFRONT DETECTADO ({perfil})")
+        print(f"============================================================")
+        pausa_manual("Resuelve el error de CloudFront en la ventana")
+    elif tipo == "antibot":
+        print(f"\n============================================================")
+        print(f"  BLOQUEO ANTI-ROBOT DETECTADO ({perfil})")
+        print(f"============================================================")
+        pausa_manual("Resuelve la verificación de robot en la ventana")
+
+
+def verificar_bloqueos(sesiones: list[dict]) -> list[tuple[int, str, str]]:
+    """Verifica si hay bloqueos en las ventanas. Retorna lista de (n, perfil, tipo_bloqueo)."""
+    bloqueadas = []
+    for sesion in sesiones:
+        page = sesion.get("page")
+        if not page:
+            continue
+        try:
+            tipo = detectar_bloqueo_tid(page)
+            if tipo:
+                bloqueadas.append((sesion["n"], sesion["perfil"], tipo))
+        except Exception:
+            continue
+    return bloqueadas
+
+
+def manejar_bloqueos(sesiones: list[dict], momento: str, max_espera_verificacion: float = 3.0) -> bool:
+    """Detecta y maneja bloqueos en las ventanas."""
+    bloqueadas = verificar_bloqueos(sesiones)
+    if bloqueadas:
+        tipos = {m for _, _, m in bloqueadas}
+        if "403 CloudFront" in tipos and "antibot" in tipos:
+            titulo = "BLOQUEO TIDAL (antibot y 403 CloudFront)"
+        elif "403 CloudFront" in tipos:
+            titulo = "ERROR 403 CLOUDFRONT"
+        else:
+            titulo = "VERIFICACIÓN ANTI-ROBOT (TIDAL)"
+
+        bar = "=" * 62
+        print(f"\n{bar}\n  {titulo} — {momento}\n{bar}")
+        for n, perfil, motivo in bloqueadas:
+            print(f"   • Ventana [{n}] — {perfil} ({motivo})")
+        print(f"\n  Total: {len(bloqueadas)} ventana(s) afectada(s)")
+
+        pausa_manual(f"Resuelve el {titulo} en las ventanas marcadas")
+        return False
+    return True
+
+
+def leer_cuentas(archivo: Path | None = None) -> dict[str, str]:
+    """Lee el archivo cuentastidal.txt y retorna un diccionario {email_lower: contrasena}."""
+    archivo = archivo or DEFAULT_CUENTAS_FILE
+    if not archivo.is_file():
+        return {}
+    cuentas = {}
+    with open(archivo, "r", encoding="utf-8") as f:
+        for linea in f:
+            linea = linea.strip()
+            if not linea or linea.startswith("#"):
+                continue
+            # Separar por espacio o tabulador
+            partes = linea.split()
+            if len(partes) >= 2:
+                email = partes[0].strip().lower()
+                pwd = partes[1].strip()
+                cuentas[email] = pwd
+    return cuentas
+
+
+def extraer_url_limpia(linea: str) -> str | None:
+    """
+    Extrae una URL limpia de una línea de texto.
+    Maneja formatos como:
+      - https://tidal.com/...
+      - 1. https://tidal.com/...
+      - 7. https://ablink.info.tidal.com/...
+      - - https://tidal.com/...
+    """
+    if not linea:
+        return None
+    
+    # Buscar patrones de URL
+    url_pattern = re.compile(r'https?://[^\s<>"\']+', re.IGNORECASE)
+    match = url_pattern.search(linea)
+    
+    if match:
+        url = match.group(0)
+        # Limpiar caracteres problemáticos al final
+        url = url.rstrip('.,;:!?)\'"')
+        return url
+    
+    return None
+
+
+def leer_invitaciones(archivo: Path | None = None) -> list[dict[str, Any]]:
+    """Lee archivo invitaciones.txt y retorna lista de sesiones con url limpia y correo asociado."""
+    archivo = archivo or DEFAULT_INVITACIONES_FILE
+    if not archivo.is_file():
+        print(f"Archivo no encontrado: {archivo}")
+        return []
+
+    invitaciones = []
+    lineas_procesadas = 0
+    lineas_con_url = 0
+    last_url = None
+    
+    with open(archivo, "r", encoding="utf-8") as f:
+        for i, linea in enumerate(f, 1):
+            linea_original = linea.strip()
+            lineas_procesadas += 1
+            
+            # Saltar líneas vacías o comentarios
+            if not linea_original or linea_original.startswith("#"):
+                continue
+            
+            # Extraer URL limpia
+            url_limpia = extraer_url_limpia(linea_original)
+            if url_limpia:
+                last_url = url_limpia
+                continue
+            
+            # Si contiene "correo:", asociamos el correo a la última URL encontrada
+            if "correo:" in linea_original.lower() and last_url:
+                partes = linea_original.split("correo:")
+                if len(partes) > 1:
+                    email_esperado = partes[1].strip()
+                    lineas_con_url += 1
+                    invitaciones.append({
+                        "url": last_url,
+                        "email_esperado": email_esperado,
+                        "perfil": f"Perfil_{lineas_con_url}",
+                        "n": lineas_con_url,
+                        "page": None,
+                        "context": None,
+                        "profile_dir": None
+                    })
+                    last_url = None  # Resetear para buscar el siguiente enlace
+    
+    print(f"✓ Leídas {lineas_procesadas} líneas, {lineas_con_url} invitaciones con correo emparejado encontradas")
+    return invitaciones
+
+
+def frames_visibles(page):
+    """Retorna todos los frames visibles de la página."""
+    try:
+        return list(page.frames)
+    except PWError:
+        return []
+
+
+def encontrar_chrome() -> str | None:
+    """Busca la ruta del ejecutable de Chrome instalado en el sistema."""
+    posibles_rutas = [
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+    ]
+
+    for ruta in posibles_rutas:
+        if ruta.exists():
+            return str(ruta)
+
+    return None
+
+
+def fase_1_crear_perfiles(invitaciones: list[dict]) -> list[dict]:
+    """
+    Fase 1: Crea perfiles de Chrome separados para cada invitación.
+    Cada perfil tiene su propio directorio de datos completamente aislado.
+    """
+    if not invitaciones:
+        print("No hay invitaciones para procesar. Agrega links a invitaciones.txt")
+        return invitaciones
+
+    # Crear directorio base para perfiles
+    PROFILES_DIR.mkdir(exist_ok=True)
+    
+    print(f"\n=== FASE 1: Creando {len(invitaciones)} perfiles de Chrome separados ===")
+    print(f"Directorio de perfiles: {PROFILES_DIR}")
+    print("Cada perfil está COMPLETAMENTE AISLADO (cookies, sesión, almacenamiento independiente)\n")
+
+    for inv in invitaciones:
+        # Crear directorio específico para este perfil
+        profile_dir = PROFILES_DIR / f"profile_{inv['n']}"
+        profile_dir.mkdir(exist_ok=True)
+        inv["profile_dir"] = str(profile_dir)
+        print(f"[{inv['n']}] {inv['perfil']}: perfil creado en {profile_dir}")
+
+    print(f"\n✓ Fase 1 completada: {len(invitaciones)} perfil(es) creado(s)")
+    return invitaciones
+
+
+def fase_2_abrir_navegadores(playwright, invitaciones: list[dict], delay_entre_aperturas: float = 0.22) -> list[dict]:
+    """
+    Fase 2: Abre UN SOLO Chrome y crea contextos aislados para cada invitación.
+    Cada contexto es una ventana privada independiente (equivalente a incógnito).
+    """
+    if not invitaciones:
+        return invitaciones
+
+    print(f"\n=== FASE 2: Abriendo {len(invitaciones)} ventana(s) en Chrome ===")
+    print("Usando UN SOLO Chrome + contextos aislados (comportamiento incógnito)\n")
+
+    # Args anti-detección
+    args_anti_deteccion = [
+        "--incognito",
+        "--disable-blink-features=AutomationControlled",
+    ]
+
+    # Lanza UN SOLO Chrome
+    try:
+        browser = playwright.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=args_anti_deteccion,
+        )
+        print("✓ Chrome iniciado correctamente")
+    except Exception as e_inc:
+        print(f"⚠ Chrome no arrancó con --incognito ({e_inc})")
+        print("  Reintentando sin ese flag (ventanas igual aisladas por contexto)...")
+        try:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            print("✓ Chrome iniciado (sin flag --incognito)")
+        except Exception as e:
+            print(f"❌ No se pudo iniciar Chrome: {e}")
+            return invitaciones
+
+    # Guardar referencia al browser para cerrar después
+    for inv in invitaciones:
+        inv["browser"] = browser
+
+    total = len(invitaciones)
+    for i, inv in enumerate(invitaciones):
+        try:
+            # Crear contexto aislado (equivalente a ventana privada)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                locale="es-ES",
+            )
+
+            page = context.new_page()
+            
+            # 1. Navegar primero a tidal.com/pricing para inicializar la sesión/cookies
+            print(f"[{inv['n']}] {inv['perfil']}: navegando a tidal.com/pricing...")
+            try:
+                page.goto("https://tidal.com/pricing", wait_until="domcontentloaded", timeout=30000)
+                # Espera aleatoria natural (mínimo 3.0s, máximo 6.0s) para calentar sesión
+                pricing_wait = random.uniform(3.0, 6.0)
+                print(f"   [{inv['n']}] {inv['perfil']}: simulando lectura de precios por {pricing_wait:.1f}s...")
+                time.sleep(pricing_wait)
+            except Exception as e_pricing:
+                print(f"   ⚠ Aviso (pricing): {e_pricing}")
+            
+            # Pequeño retardo aleatorio de jitter antes de ir a la invitación (0.5s a 1.5s)
+            time.sleep(random.uniform(0.5, 1.5))
+            
+            # 2. Navegar a la invitación correspondiente
+            print(f"[{inv['n']}] {inv['perfil']}: cargando link de invitación...")
+            page.goto(inv["url"], wait_until="domcontentloaded", timeout=45000)
+            
+            # Comprobar si hay bloqueo de acceso restringido al cargar el link
+            recuperar_de_bloqueo_restringido(page, inv["url"], inv["perfil"])
+            
+            # Pequeña pausa para renderizado rápido
+            time.sleep(0.3)
+            
+            # Comprobar inmediatamente si ya fue aceptada para omitir esperas largas
+            if es_invitacion_ya_aceptada(page):
+                print(f"[{inv['n']}] {inv['perfil']}: 📄 Invitación YA ACEPTADA detectada inmediatamente ✓")
+                inv["exito"] = True
+                inv["page"] = page
+                inv["context"] = context
+            else:
+                # Esperar a que la página esté completamente cargada (solo si está pendiente)
+                time.sleep(2.2)
+                inv["page"] = page
+                inv["context"] = context
+                print(f"[{inv['n']}] {inv['perfil']}: ventana abierta y cargada ✓")
+            
+            # Delay entre aperturas para no sobrecargar (aleatorio entre 3.0 y 5.5 segundos)
+            if i < total - 1:
+                apertura_delay = random.uniform(3.0, 5.5)
+                print(f"   ⏳ Esperando {apertura_delay:.1f}s antes de abrir la siguiente ventana...")
+                time.sleep(apertura_delay)
+                
+        except Exception as e:
+            print(f"[{inv['n']}] Error abriendo {inv['perfil']}: {e}")
+
+    abiertas = len([i for i in invitaciones if i.get("page")])
+    print(f"\n✓ Fase 2 completada: {abiertas}/{len(invitaciones)} ventana(s) abierta(s)")
+    print(f"  Usando 1 Chrome con {abiertas} contexto(s) aislado(s)")
+    return invitaciones
+
+
+def detectar_email_en_pagina(page) -> str | None:
+    """
+    Detecta el email que aparece en la página de invitación TIDAL.
+    Busca en: URL (parámetros), campos input, texto de la página, elementos de invitación.
+    """
+    import urllib.parse
+    
+    try:
+        if page.is_closed():
+            return None
+    except PWError:
+        return None
+
+    # Patrón regex para emails
+    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+    
+    # 1. Buscar en la URL (TIDAL suele pasar email como parámetro email=...)
+    try:
+        url = page.url
+        if 'email=' in url.lower():
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            
+            for key in ['email', 'Email', 'EMAIL']:
+                if key in params and params[key]:
+                    email_encoded = params[key][0]
+                    # Decodificar URL encoding (ej: %40 → @)
+                    email_decoded = urllib.parse.unquote(email_encoded)
+                    if email_pattern.match(email_decoded):
+                        print(f"   ✓ Email detectado en URL: {email_decoded}")
+                        return email_decoded.lower().strip()
+    except:
+        pass
+    
+    # 2. Buscar en campos de email
+    try:
+        email_selectors = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[autocomplete="email"]',
+            'input[id*="email" i]',
+        ]
+        
+        for sel in email_selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() and loc.is_visible(timeout=500):
+                    valor = loc.input_value(timeout=500)
+                    if valor and email_pattern.match(valor):
+                        return valor.lower().strip()
+            except:
+                continue
+    except:
+        pass
+
+    # 3. Buscar en el texto de la página (párrafos, divs, spans)
+    try:
+        # Obtener todo el texto visible
+        texto_pagina = page.locator('body').inner_text(timeout=1000)
+        
+        # Buscar emails en el texto
+        emails_encontrados = email_pattern.findall(texto_pagina)
+        if emails_encontrados:
+            # Retornar el primer email válido (excluir dominios de TIDAL)
+            for email in emails_encontrados:
+                email_lower = email.lower().strip()
+                if 'tidal.com' not in email_lower and 'tidal' not in email_lower:
+                    return email_lower
+    except:
+        pass
+
+    # 4. Buscar en elementos específicos de invitación
+    try:
+        # TIDAL suele mostrar el email en elementos con texto "invita" o similar
+        elementos_invitacion = page.locator('text=/invita|invited|invitation|invitación/i').all()
+        for elem in elementos_invitacion:
+            try:
+                texto = elem.inner_text(timeout=500)
+                emails_encontrados = email_pattern.findall(texto)
+                if emails_encontrados:
+                    for email in emails_encontrados:
+                        email_lower = email.lower().strip()
+                        if 'tidal.com' not in email_lower:
+                            return email_lower
+            except:
+                continue
+    except:
+        pass
+
+    return None
+
+
+def buscar_password_por_email(email_detectado: str, cuentas: dict[str, str]) -> str | None:
+    """
+    Busca el email detectado en el diccionario de cuentas y retorna la contraseña correspondiente.
+    """
+    if not email_detectado:
+        print(f"   ⚠ No hay email para buscar")
+        return None
+
+    email_detectado_lower = email_detectado.lower().strip()
+    print(f"   🔍 Buscando '{email_detectado_lower}' en cuentastidal.txt ({len(cuentas)} cuentas disponibles)...")
+    
+    password = cuentas.get(email_detectado_lower)
+    if password:
+        print(f"   ✓ Cuenta encontrada y contraseña obtenida de cuentastidal.txt")
+        return password
+    
+    print(f"   ❌ Email '{email_detectado_lower}' NO encontrado en cuentastidal.txt")
+    return None
+
+
+def es_pagina_registro(page) -> bool:
+    """Detecta si estamos en la página de registro 'Crea tu cuenta'."""
+    try:
+        # Buscar indicadores de página de registro
+        titulo = page.locator('h1, h2, h3').first
+        if titulo.count():
+            texto = titulo.inner_text(timeout=2000).lower()
+            if "crea tu cuenta" in texto or "create account" in texto:
+                return True
+        
+        # Buscar campo de contraseña con label "Crea tu contraseña"
+        labels = page.locator('label, span, div').all()
+        for label in labels[:10]:  # Solo primeros 10 elementos
+            try:
+                texto = label.inner_text()
+                if "crea tu contraseña" in texto.lower() or "create password" in texto.lower():
+                    return True
+            except:
+                continue
+        
+        return False
+    except:
+        return False
+
+
+def es_pagina_login_completo(page) -> bool:
+    """
+    Detecta si estamos en la página de 'Iniciar sesión' completa (rápido).
+    Esto significa que la cuenta ya existe y la invitación ya fue aceptada.
+    """
+    try:
+        # Verificar campo de contraseña rápido
+        pwd_field = page.locator('input[type="password"]').first
+        if pwd_field.count() > 0:
+            # Asegurarnos de que no es la página de registro
+            if not es_pagina_registro(page):
+                return True
+        return False
+    except:
+        return False
+
+
+def manejar_opcion_contrasena(page, perfil: str = "Ventana") -> bool:
+    """
+    Detecta si la página ofrece la opción 'Inicia sesión con contraseña' (passwordless login code screen)
+    y hace clic en ella para continuar por la vía de contraseña tradicional.
+    Retorna True si se hizo clic y el campo de contraseña se muestra.
+    """
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    # 1. Comprobar si ya se muestra el campo de contraseña
+    try:
+        if page.locator('input[type="password"]').count() > 0:
+            print(f"   ✓ Campo de contraseña ya visible (count > 0)")
+            return True
+    except:
+        pass
+
+    # 2. Comprobar si existe el enlace para cambiar a contraseña en algún frame antes de esperar o clicar
+    btn_selector = "button.login-with-password, .login-with-password, button:has-text('Inicia sesión con contraseña'), button:has-text('Iniciar sesión con contraseña')"
+    tiene_opcion = False
+    for frame in frames_visibles(page):
+        try:
+            if frame.locator(btn_selector).count() > 0:
+                tiene_opcion = True
+                break
+        except:
+            continue
+            
+    if not tiene_opcion:
+        # No está la pantalla de código/passwordless (ni campo de contraseña ni botón de cambio). Salir inmediatamente.
+        return False
+
+    print(f"   🔍 Buscando opción para cambiar a contraseña...")
+
+    # Esperar 1.0 segundo para que terminen de vincularse los event listeners
+    time.sleep(1.0)
+
+    patrones_texto = [
+        "inicia sesión con contraseña",
+        "iniciar sesión con contraseña",
+        "inicia sesion con contrasena",
+        "iniciar sesion con contrasena",
+        "log in with password",
+        "login with password",
+        "contraseña",
+    ]
+
+    for click_attempt in range(1, 4):
+        # Comprobar si ya se muestra el campo de contraseña
+        try:
+            if page.locator('input[type="password"]').count() > 0:
+                print(f"   ✓ Campo de contraseña ya visible (count > 0)")
+                return True
+        except:
+            pass
+
+        print(f"   🖱 Intentando pulsar opción de contraseña (intento {click_attempt} de 3)...")
+
+        clicado = False
+        for frame in frames_visibles(page):
+            # 1. Intentar por clase CSS específica de TIDAL (Método muy directo y fiable)
+            try:
+                btn_css = frame.locator("button.login-with-password, .login-with-password").first
+                if btn_css.count() > 0:
+                    try:
+                        btn_css.click(force=True, timeout=1000)
+                        clicado = True
+                        break
+                    except:
+                        try:
+                            btn_css.dispatch_event("click")
+                            clicado = True
+                            break
+                        except:
+                            pass
+            except:
+                pass
+
+            # 2. Intentar buscar por get_by_text con regex
+            if not clicado:
+                for texto in patrones_texto:
+                    try:
+                        locator = frame.get_by_text(re.compile(texto, re.I))
+                        count = locator.count()
+                        for i in range(count):
+                            elem = locator.nth(i)
+                            try:
+                                elem.click(force=True, timeout=1000)
+                                clicado = True
+                                break
+                            except:
+                                try:
+                                    elem.dispatch_event("click")
+                                    clicado = True
+                                    break
+                                except:
+                                    pass
+                        if clicado:
+                            break
+                    except:
+                        continue
+
+            # 3. Intentar buscar cualquier elemento con tag a, button, span, div, p que contenga la palabra clave 'contrase' o 'password'
+            if not clicado:
+                try:
+                    all_elements = frame.locator('a, button, span, div, p').all()
+                    for elem in all_elements:
+                        try:
+                            txt = elem.inner_text().lower()
+                            if "contrase" in txt or "password" in txt:
+                                if "inicia" in txt or "log" in txt or "con" in txt or "with" in txt:
+                                    try:
+                                        elem.click(force=True, timeout=1000)
+                                        clicado = True
+                                        break
+                                    except:
+                                        try:
+                                            elem.dispatch_event("click")
+                                            clicado = True
+                                            break
+                                        except:
+                                            pass
+                        except:
+                            continue
+                    if clicado:
+                        break
+                except:
+                    pass
+
+            # 4. JS directo en el frame para hacer clic en el botón/link
+            if not clicado:
+                try:
+                    clicked_js = frame.evaluate("""
+                        () => {
+                            // Clic por selector CSS específico
+                            const btnCss = document.querySelector('.login-with-password');
+                            if (btnCss) {
+                                try {
+                                    btnCss.click();
+                                    return true;
+                                } catch(e) {}
+                                try {
+                                    const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                                    btnCss.dispatchEvent(ev);
+                                    return true;
+                                } catch(e) {}
+                            }
+
+                            const findAndClick = (txt) => {
+                                const xpath = `//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ', 'abcdefghijklmnopqrstuvwxyzaeioun'), '${txt}')]`;
+                                const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                                const element = result.singleNodeValue;
+                                if (element) {
+                                    try {
+                                        element.click();
+                                        return true;
+                                    } catch(e) {}
+                                    
+                                    try {
+                                        const clickEvent = document.createEvent('MouseEvents');
+                                        clickEvent.initEvent('click', true, true);
+                                        element.dispatchEvent(clickEvent);
+                                        return true;
+                                    } catch(e) {}
+                                }
+                                return false;
+                            };
+                            
+                            const targets = ['inicia sesion con contrasena', 'iniciar sesion con contrasena', 'login with password', 'log in with password', 'contraseña', 'password'];
+                            for (const t of targets) {
+                                if (findAndClick(t)) return true;
+                            }
+                            
+                            const elems = document.querySelectorAll('a, button, span, div, p');
+                            for (const el of elems) {
+                                const t = el.textContent.toLowerCase();
+                                if ((t.includes('contrase') || t.includes('password')) && (t.includes('inicia') || t.includes('log') || t.includes('iniciar'))) {
+                                    try {
+                                        el.click();
+                                        return true;
+                                    } catch(e) {}
+                                    
+                                    try {
+                                        const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                                        el.dispatchEvent(ev);
+                                        return true;
+                                    } catch(e) {}
+                                }
+                            }
+                            return false;
+                        }
+                    """)
+                    if clicked_js:
+                        clicado = True
+                        break
+                except:
+                    pass
+
+        # Esperar 1.5 segundos a que la página procese el click
+        time.sleep(1.5)
+        
+        # Comprobar si ya se muestra el campo de contraseña
+        try:
+            if page.locator('input[type="password"]').count() > 0:
+                print(f"   ✓ Clic procesado con éxito: pantalla de contraseña visible (count > 0)")
+                return True
+        except:
+            pass
+
+    return False
+
+
+def es_bloqueo_acceso_restringido(page) -> bool:
+    """
+    Detecta si la página muestra el mensaje de bloqueo 'El acceso está restringido temporalmente'.
+    """
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    textos_clave = [
+        "acceso esta restringido temporalmente",
+        "acceso esta restringido",
+        "acceso restringido",
+        "acceso restringido temporalmente",
+        "access is temporarily restricted",
+        "restricted access",
+    ]
+
+    def normalizar(t: str) -> str:
+        t = t.lower()
+        remplazos = {
+            'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+            'ü': 'u', 'ñ': 'n'
+        }
+        for orig, dest in remplazos.items():
+            t = t.replace(orig, dest)
+        return " ".join(t.split())
+
+    for frame in frames_visibles(page):
+        try:
+            body_txt = frame.locator("body").inner_text(timeout=1000)
+            body_txt_norm = normalizar(body_txt)
+            if any(t in body_txt_norm for t in textos_clave):
+                return True
+        except Exception:
+            continue
+            
+    try:
+        html_norm = normalizar(page.content())
+        if any(t in html_norm for t in textos_clave):
+            return True
+    except:
+        pass
+        
+    return False
+
+
+def recuperar_de_bloqueo_restringido(page, url_invitacion: str, perfil: str = "Ventana") -> bool:
+    """
+    Si se detecta el bloqueo de 'Acceso restringido', navega de vuelta a tidal.com/pricing,
+    espera unos segundos, y vuelve a cargar la invitación correspondiente.
+    Retorna True si se aplicó la recuperación.
+    """
+    if es_bloqueo_acceso_restringido(page):
+        print(f"\n   [{perfil}] ⚠ BLOQUEO DE ACCESO RESTRINGIDO DETECTADO.")
+        print(f"   [{perfil}] 🔄 Intentando recuperación: navegando a tidal.com/pricing...")
+        try:
+            page.goto("https://tidal.com/pricing", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3.0)  # Esperar unos segundos
+            print(f"   [{perfil}] 🔄 Volviendo a cargar el enlace de invitación...")
+            page.goto(url_invitacion, wait_until="domcontentloaded", timeout=45000)
+            time.sleep(1.0)
+            return True
+        except Exception as e:
+            print(f"   [{perfil}] ⚠ Error durante la recuperación de bloqueo: {e}")
+    return False
+
+
+def es_invitacion_ya_aceptada(page) -> bool:
+    """
+    Detecta si la invitación ya fue aceptada o caducó (mensaje rojo).
+    """
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    def normalizar(t: str) -> str:
+        t = t.lower()
+        # Reemplazar acentos y caracteres especiales comunes
+        remplazos = {
+            'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u',
+            'ü': 'u', 'ñ': 'n'
+        }
+        for orig, dest in remplazos.items():
+            t = t.replace(orig, dest)
+        # Reemplazar entidades HTML comunes y normalizar espacios
+        t = t.replace('&oacute;', 'o').replace('&html;', '').replace('&nbsp;', ' ')
+        t = " ".join(t.split())
+        return t
+
+    # Palabras clave normalizadas (sin acentos, minúsculas, espacio simple)
+    textos_clave = [
+        "ya se ha aceptado o ha caducado",
+        "ya se ha aceptado",
+        "ha caducado",
+        "invitation has already been accepted",
+        "accepted or expired",
+        "link has already been accepted",
+        "enlace de invitacion ya se ha",
+        "enlace ya se ha aceptado",
+        "enlace de invitacion ya se ha aceptado o ha caducado",
+    ]
+
+    # Comprobar texto de todos los frames usando inner_text de forma optimizada
+    for idx, frame in enumerate(frames_visibles(page)):
+        try:
+            body_txt = frame.locator("body").inner_text(timeout=800)
+            body_txt_norm = normalizar(body_txt)
+            for txt in textos_clave:
+                if txt in body_txt_norm:
+                    print(f"      [Detección] Enlace ya aceptado/caducado detectado en Texto del Frame [{idx}] (clave: '{txt}')")
+                    return True
+        except Exception:
+            continue
+
+    return False
+
+
+def aceptar_cookies(page) -> bool:
+    """Acepta el banner de cookies si está presente en la página o en cualquier frame."""
+    try:
+        if page.is_closed():
+            return False
+    except PWError:
+        return False
+
+    btn_selectors = [
+        'button:has-text("Aceptar")',
+        'button:has-text("Accept")',
+        'button:has-text("Rechazar")',
+        'button:has-text("Reject")',
+        '[aria-label*="cookie" i] button',
+        '[class*="cookie" i] button',
+    ]
+
+    for frame in frames_visibles(page):
+        # 1. Intentar por selectores conocidos en Playwright
+        for sel in btn_selectors:
+            try:
+                btn = frame.locator(sel).first
+                if btn.count() > 0:
+                    try:
+                        btn.click(force=True, timeout=2000)
+                        print(f"   ✓ Cookies aceptadas ({sel})")
+                        time.sleep(1.0)
+                        return True
+                    except:
+                        try:
+                            btn.dispatch_event("click")
+                            print(f"   ✓ Cookies aceptadas (dispatch: {sel})")
+                            time.sleep(1.0)
+                            return True
+                        except:
+                            pass
+            except:
+                continue
+
+        # 2. Respaldo por JavaScript directo en el frame para buscar botones comunes de cookies
+        try:
+            clicked_js = frame.evaluate("""
+                () => {
+                    const selectors = [
+                        'button', 'a', '[role="button"]'
+                    ];
+                    const targets = ['aceptar', 'accept', 'rechazar', 'reject', 'agree', 'permitir', 'allow'];
+                    const elems = document.querySelectorAll(selectors.join(','));
+                    for (const el of elems) {
+                        const txt = el.textContent.toLowerCase().trim();
+                        // Verificar que no sea el botón de continuar o registro
+                        if (txt.includes('continuar') || txt.includes('regist')) continue;
+                        
+                        for (const target of targets) {
+                            if (txt === target || (txt.includes(target) && txt.length < 20)) {
+                                try { el.click(); return true; } catch(e) {}
+                                try {
+                                    const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                                    el.dispatchEvent(ev);
+                                    return true;
+                                } catch(e) {}
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if clicked_js:
+                print(f"   ✓ Cookies aceptadas mediante JS en el frame")
+                time.sleep(1.0)
+                return True
+        except:
+            pass
+
+    return False
+
+
+def completar_registro(page, email: str, password: str) -> bool:
+    """
+    Completa el formulario de registro completo:
+    0. Aceptar cookies si hay banner
+    1. Rellenar contraseña
+    2. Seleccionar fecha de nacimiento aleatoria (año antes de 2004)
+    3. Marcar checkbox de términos
+    4. Clic en "Suscríbete"
+    """
+    import random
+    
+    print(f"   📝 Completando registro...")
+    
+    # === PASO 0: Aceptar cookies primero ===
+    print(f"   🍪 Verificando banner de cookies...")
+    aceptar_cookies(page)
+    time.sleep(1.0)
+    
+    # === PASO 1: Rellenar contraseña ===
+    try:
+        print(f"   🔒 Rellenando contraseña...")
+        pwd_field = page.locator('input[type="password"]').first
+        if pwd_field.count() and pwd_field.is_visible(timeout=3000):
+            pwd_field.fill(password, timeout=5000)
+            print(f"   ✓ Contraseña rellenada")
+            time.sleep(0.5)
+    except Exception as e:
+        print(f"   ⚠ Error rellenando contraseña: {e}")
+        return False
+    
+    # === PASO 2: Seleccionar fecha de nacimiento aleatoria ===
+    try:
+        print(f"   📅 Seleccionando fecha de nacimiento (año antes de 2004)...")
+        
+        # Día aleatorio (1-28)
+        dia = random.randint(1, 28)
+        # Mes aleatorio (1-12)
+        mes = random.randint(1, 12)
+        # Año aleatorio (1980-2003) - antes de 2004 para mayor de edad
+        anio = random.randint(1980, 2003)
+        
+        # Función auxiliar para seleccionar de un dropdown custom
+        def seleccionar_dropdown(page, select_id, valor, tipo="valor"):
+            try:
+                # Buscar el contenedor del select (generalmente un div o button que abre el dropdown)
+                selectores_trigger = [
+                    f'select#{select_id}',
+                    f'[id*="{select_id}"]',
+                    f'[data-testid*="{select_id}"]',
+                    f'button[aria-labelledby*="{select_id}"]',
+                ]
+                
+                trigger = None
+                for sel in selectores_trigger:
+                    trigger = page.locator(sel).first
+                    if trigger.count() and trigger.is_visible(timeout=2000):
+                        break
+                
+                if not trigger or not trigger.count():
+                    return False
+                
+                # Hacer clic para abrir el dropdown
+                trigger.click(timeout=3000)
+                time.sleep(0.5)  # Esperar que se abra
+                
+                # Buscar la opción por valor o texto
+                if tipo == "mes":
+                    # Para mes, buscar por número o nombre
+                    opciones = [
+                        f'option[value="{valor}"]',
+                        f'li:has-text("{valor}")',
+                        f'div:has-text("{valor}")',
+                        f'[role="option"]:has-text("{valor}")',
+                    ]
+                else:
+                    # Para día o año
+                    opciones = [
+                        f'option:has-text("{valor}")',
+                        f'option[value="{valor}"]',
+                        f'li:has-text("{valor}")',
+                        f'div:has-text("{valor}")',
+                        f'[role="option"]:has-text("{valor}")',
+                    ]
+                
+                for opcion_sel in opciones:
+                    try:
+                        opcion = page.locator(opcion_sel).first
+                        if opcion.count() and opcion.is_visible(timeout=1000):
+                            opcion.click(timeout=3000)
+                            time.sleep(0.3)
+                            return True
+                    except:
+                        continue
+                
+                return False
+            except Exception as e:
+                return False
+        
+        # Intentar seleccionar usando el método tradicional primero
+        try:
+            # TIDAL usa IDs específicos: tbi-day, tbi-month, tbi-year
+            day_select = page.locator('select#tbi-day').first
+            month_select = page.locator('select#tbi-month').first
+            year_select = page.locator('select#tbi-year').first
+            
+            # Seleccionar día
+            if day_select.count() and day_select.is_visible(timeout=1000):
+                try:
+                    day_select.select_option(str(dia))
+                    print(f"   ✓ Día seleccionado: {dia}")
+                    time.sleep(0.3)
+                except:
+                    # Fallback: método de dropdown
+                    if seleccionar_dropdown(page, "tbi-day", str(dia), "dia"):
+                        print(f"   ✓ Día seleccionado (dropdown): {dia}")
+            
+            # Seleccionar mes
+            if month_select.count() and month_select.is_visible(timeout=1000):
+                try:
+                    month_select.select_option(str(mes))
+                    print(f"   ✓ Mes seleccionado: {mes}")
+                    time.sleep(0.3)
+                except:
+                    # Fallback: método de dropdown
+                    if seleccionar_dropdown(page, "tbi-month", str(mes), "mes"):
+                        print(f"   ✓ Mes seleccionado (dropdown): {mes}")
+            
+            # Seleccionar año
+            if year_select.count() and year_select.is_visible(timeout=1000):
+                try:
+                    year_select.select_option(str(anio))
+                    print(f"   ✓ Año seleccionado: {anio}")
+                    time.sleep(0.3)
+                except Exception as year_err:
+                    # Fallback: método de dropdown
+                    print(f"   🔄 Intentando método alternativo para año...")
+                    if seleccionar_dropdown(page, "tbi-year", str(anio), "anio"):
+                        print(f"   ✓ Año seleccionado (dropdown): {anio}")
+                    else:
+                        print(f"   ⚠ No se pudo seleccionar el año")
+            else:
+                print(f"   ⚠ No se encontró select de año")
+                
+        except Exception as e:
+            print(f"   ⚠ Error seleccionando fecha: {e}")
+            # Intentar método alternativo completo
+            print(f"   🔄 Intentando método alternativo completo...")
+            for campo, valor, tipo in [("tbi-day", str(dia), "dia"), ("tbi-month", str(mes), "mes"), ("tbi-year", str(anio), "anio")]:
+                if seleccionar_dropdown(page, campo, valor, tipo):
+                    print(f"   ✓ {tipo.capitalize()} seleccionado")
+    except Exception as e:
+        print(f"   ⚠ Error en fecha de nacimiento: {e}")
+    
+    time.sleep(1.0)
+    
+    # === PASO 3: Marcar checkbox de términos ===
+    try:
+        print(f"   ☑ Marcando términos y condiciones...")
+        
+        checkbox_encontrado = False
+        
+        # Método 1: Buscar directamente por id="terms1" (selector exacto de TIDAL)
+        try:
+            cb = page.locator('#terms1')
+            if cb.count():
+                cb.click(force=True)
+                checkbox_encontrado = True
+                print(f"   ✓ Términos aceptados (#terms1)")
+        except:
+            pass
+        
+        # Método 2: Hacer clic en el label[for="terms1"]
+        if not checkbox_encontrado:
+            try:
+                label = page.locator('label[for="terms1"]')
+                if label.count() and label.is_visible(timeout=1000):
+                    label.click(timeout=3000)
+                    checkbox_encontrado = True
+                    print(f"   ✓ Términos aceptados (label for=terms1)")
+            except:
+                pass
+        
+        # Método 3: JavaScript directo con id terms1
+        if not checkbox_encontrado:
+            try:
+                result = page.evaluate("""
+                    () => {
+                        // Buscar por ID exacto
+                        const cb = document.getElementById('terms1');
+                        if (cb) {
+                            cb.click();
+                            return 'clicked_terms1';
+                        }
+                        // Buscar el label y hacer clic
+                        const label = document.querySelector('label[for="terms1"]');
+                        if (label) {
+                            label.click();
+                            return 'clicked_label_terms1';
+                        }
+                        // Fallback: buscar por for que contenga "terms"
+                        const labels = document.querySelectorAll('label[for*="terms"]');
+                        if (labels.length > 0) {
+                            labels[labels.length - 1].click();
+                            return 'clicked_label_terms';
+                        }
+                        return 'not_found';
+                    }
+                """)
+                if result and result != 'not_found':
+                    checkbox_encontrado = True
+                    print(f"   ✓ Términos aceptados (JS: {result})")
+            except:
+                pass
+        
+        # Método 4: Buscar checkbox con for="terms" por Playwright
+        if not checkbox_encontrado:
+            try:
+                cb = page.locator('input[id*="terms"], input[name*="terms"]').last
+                if cb.count():
+                    cb.click(force=True)
+                    checkbox_encontrado = True
+                    print(f"   ✓ Términos aceptados (input terms)")
+            except:
+                pass
+        
+        # Método 5: Segundo checkbox en la página con force click
+        if not checkbox_encontrado:
+            try:
+                checkboxes = page.locator('input[type="checkbox"]').all()
+                if len(checkboxes) >= 2:
+                    checkboxes[1].click(force=True)
+                    checkbox_encontrado = True
+                    print(f"   ✓ Términos aceptados (segundo checkbox force)")
+            except:
+                pass
+        
+        if not checkbox_encontrado:
+            print(f"   ⚠ No se encontró checkbox de términos")
+    except Exception as e:
+        print(f"   ⚠ Error marcando términos: {e}")
+    
+    # Esperar a que el botón Suscríbete se habilite tras marcar términos
+    print(f"   ⏳ Esperando habilitación del botón...")
+    time.sleep(2.0)
+    
+    # === PASO 4: Clic en "Suscríbete" ===
+    try:
+        print(f"   🖱 Pulsando botón 'Suscríbete'...")
+        
+        # Buscar botón suscríbete por múltiples métodos
+        # Método 1: Por texto exacto
+        try:
+            btn = page.get_by_text("Suscríbete", exact=False).first
+            if btn.count() and btn.is_visible(timeout=2000):
+                # Verificar si es un botón o está dentro de uno
+                try:
+                    btn.click(timeout=5000)
+                    print(f"   ✓ Botón 'Suscríbete' pulsado (por texto)")
+                    return True
+                except:
+                    pass
+        except:
+            pass
+        
+        # Método 2: Por role button con texto
+        try:
+            btn = page.get_by_role("button", name=re.compile(r"suscríbete|subscribe", re.I)).first
+            if btn.count() and btn.is_visible(timeout=2000):
+                btn.click(timeout=5000)
+                print(f"   ✓ Botón 'Suscríbete' pulsado (por role)")
+                return True
+        except:
+            pass
+        
+        # Método 3: Selectores CSS
+        btn_selectors = [
+            'button:has-text("Suscríbete")',
+            'button:has-text("suscríbete")',
+            'button:has-text("Subscribe")',
+            'button[type="submit"]',
+            'button[class*="primary"]',
+            'button[class*="submit"]',
+            'button[class*="Button"]',
+            '[data-testid*="submit"]',
+        ]
+        
+        for sel in btn_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() and btn.is_visible(timeout=2000):
+                    # Verificar que no esté deshabilitado
+                    try:
+                        is_disabled = btn.is_disabled()
+                        if is_disabled:
+                            continue  # Saltar si está deshabilitado
+                    except:
+                        pass
+                    
+                    btn.click(timeout=5000)
+                    print(f"   ✓ Botón 'Suscríbete' pulsado (selector: {sel[:30]}...)")
+                    return True
+            except:
+                continue
+        
+        # Método 4: Buscar cualquier botón visible en la parte inferior del formulario
+        try:
+            buttons = page.locator('button').all()
+            for btn in buttons:
+                try:
+                    if btn.is_visible(timeout=1000):
+                        texto = btn.inner_text()
+                        if any(palabra in texto.lower() for palabra in ['suscríbete', 'subscribe', 'registrar', 'continuar', 'aceptar']):
+                            btn.click(timeout=5000)
+                            print(f"   ✓ Botón pulsado: {texto[:20]}...")
+                            return True
+                except:
+                    continue
+        except:
+            pass
+        
+        print(f"   ⚠ No se encontró botón 'Suscríbete' habilitado")
+        return False
+    except Exception as e:
+        print(f"   ⚠ Error pulsando botón: {e}")
+        return False
+
+
+def realizar_login_cuenta_existente(page, email: str, password: str, perfil: str = "Ventana") -> bool:
+    """
+    Rellena la contraseña en la página de login existente y pulsa 'Iniciar sesión'.
+    Resuelve captchas si aparecen.
+    Si se regresa a la pantalla de código, reintenta (hasta 3 veces) pulsando de nuevo en el link de contraseña.
+    """
+    print(f"   🔑 [Cambio de Plan] Iniciando sesión con contraseña para {email}...")
+    
+    intentos_login = 3
+    for intento in range(1, intentos_login + 1):
+        print(f"   🔒 [Intento {intento} de {intentos_login}] Rellenando contraseña...")
+        try:
+            # Aceptar cookies por si acaso
+            aceptar_cookies(page)
+            
+            # Encontrar campo de contraseña
+            pwd_field = page.locator('input[type="password"]').first
+            if pwd_field.count() and pwd_field.is_visible(timeout=5000):
+                pwd_field.fill(password, timeout=5000)
+                print(f"   ✓ Contraseña rellenada")
+                time.sleep(0.5)
+            else:
+                # Si el campo de contraseña no está visible, pero estamos en la pantalla de código
+                if manejar_opcion_contrasena(page, perfil):
+                    print(f"   ⏳ Esperando transición a login completo tras pulsar opción contraseña...")
+                    time.sleep(2.5)
+                    # Intentar volver a buscar el campo de contraseña
+                    pwd_field = page.locator('input[type="password"]').first
+                    if pwd_field.count() and pwd_field.is_visible(timeout=5000):
+                        pwd_field.fill(password, timeout=5000)
+                        print(f"   ✓ Contraseña rellenada (tras reintento de opción)")
+                        time.sleep(0.5)
+                    else:
+                        print(f"   ❌ No se encontró el campo de contraseña tras cambiar de pantalla")
+                        continue
+                else:
+                    print(f"   ❌ No se encontró el campo de contraseña")
+                    continue
+                
+            # Buscar y pulsar botón de iniciar sesión (priorizando type="submit" para no pulsar "con código")
+            btn_iniciar = page.locator('button[type="submit"]').first
+            if not btn_iniciar.count() or not btn_iniciar.is_visible(timeout=1000):
+                patrones_iniciar = (
+                    re.compile(r"^\s*iniciar\s+sesi[oó]n\s*$", re.I),
+                    re.compile(r"^\s*inicia\s+sesi[oó]n\s*$", re.I),
+                    re.compile(r"^\s*log\s+in\s*$", re.I),
+                )
+                for pat in patrones_iniciar:
+                    btn = page.get_by_role("button", name=pat).first
+                    if btn.count() and btn.is_visible(timeout=500):
+                        btn_iniciar = btn
+                        break
+                
+            if btn_iniciar.count() and btn_iniciar.is_visible(timeout=3000):
+                print(f"   🖱 Pulsando 'Iniciar sesión'...")
+                btn_iniciar.click(timeout=5000)
+                
+                # Esperar redirección, captcha o código de correo
+                print(f"   ⏳ Esperando redirección de login...")
+                login_completado = False
+                for _ in range(15):
+                    # 1. Resolver captcha si aparece
+                    if detectar_antibot_tid(page) or detectar_captcha_caducado(page) or detectar_error_403_cloudfront(page):
+                        print(f"   [Antibot] Bloqueo o captcha detectado durante login. Resolviendo...")
+                        chequear_y_resolver_bloqueos_pagina(page, perfil)
+                        time.sleep(2.0)
+                        
+                    # 2. Comprobar si nos envió de vuelta a la pantalla de verificación por código (2FA / Código de correo)
+                    try:
+                        body_text = page.locator("body").inner_text().lower()
+                        if page.locator(".login-with-password").count() > 0 or "revisa tu correo" in body_text or "enviado un codigo" in body_text or "check your email" in body_text or "sent a 6-digit" in body_text:
+                            print(f"\n   ⚠️ [{perfil}] [Seguridad TIDAL] Regresó a pantalla de código. Reintentando...")
+                            login_completado = False
+                            break
+                    except:
+                        pass
+
+                    # 3. Comprobar si ya salió de la página de login (el campo de contraseña ya no está y no es la pantalla de código)
+                    try:
+                        if not page.locator('input[type="password"]').first.is_visible(timeout=500):
+                            # Verificar que no hayamos caído en la pantalla de código
+                            has_code_screen = False
+                            try:
+                                body_text = page.locator("body").inner_text().lower()
+                                has_code_screen = page.locator(".login-with-password").count() > 0 or "revisa tu correo" in body_text or "enviado un codigo" in body_text
+                            except:
+                                pass
+                            
+                            if not has_code_screen:
+                                login_completado = True
+                                break
+                    except:
+                        login_completado = True
+                        break
+                        
+                    time.sleep(1.0)
+                
+                if login_completado:
+                    print(f"   ✓ Login completado con éxito")
+                    return True
+                else:
+                    # Si no se completó (ej: volvió a la pantalla de código), el bucle continúa al siguiente intento
+                    time.sleep(1.5)
+            else:
+                print(f"   ❌ No se encontró botón 'Iniciar sesión'")
+                
+        except Exception as e:
+            print(f"   ❌ Error durante intento {intento} de login: {e}")
+            time.sleep(1.5)
+            
+    print(f"   ❌ No se pudo completar el login tras {intentos_login} intentos")
+    return False
+
+
+def procesar_botones_aceptacion_y_confirmacion(page, perfil: str = "Ventana") -> bool:
+    """
+    Busca el botón de aceptar invitación en la página y lo pulsa.
+    Luego, si aparece el modal de confirmación ('Join Family'), lo pulsa también.
+    Usa múltiples métodos de búsqueda y clics forzados sin restricciones de visibilidad.
+    """
+    print(f"   🔍 Buscando botón de aceptación de invitación ('Accept Invitation')...")
+    time.sleep(2.5)  # Esperar que cargue bien la página/modal
+    
+    # Resolver captchas o bloqueos
+    chequear_y_resolver_bloqueos_pagina(page, perfil)
+
+    # 1. Buscar botón principal de aceptar invitación
+    btn_aceptar = None
+    
+    # Métodos de búsqueda para el botón principal
+    patrones_texto = [
+        r"accept\s+invitation",
+        r"aceptar\s+invitaci[oó]n",
+        r"join\s+family",
+        r"unirse\s+al\s+plan",
+        r"unirse",
+        r"aceptar",
+    ]
+    
+    # Intentar buscar en todos los frames
+    for frame in frames_visibles(page):
+        # Método A: get_by_role (button o link)
+        for t in patrones_texto:
+            try:
+                for role in ["button", "link"]:
+                    locator = frame.get_by_role(role, name=re.compile(t, re.I))
+                    if locator.count() > 0:
+                        btn_aceptar = locator.first
+                        break
+                if btn_aceptar:
+                    break
+            except:
+                pass
+        if btn_aceptar:
+            break
+            
+        # Método B: get_by_text
+        if not btn_aceptar:
+            for t in patrones_texto:
+                try:
+                    locator = frame.get_by_text(re.compile(t, re.I))
+                    if locator.count() > 0:
+                        btn_aceptar = locator.first
+                        break
+                except:
+                    pass
+            if btn_aceptar:
+                break
+                
+        # Método C: Selector CSS de botón o enlace que contenga el texto
+        if not btn_aceptar:
+            try:
+                locator = frame.locator("button, a").filter(has_text=re.compile(r"accept|aceptar|join|unirse", re.I)).first
+                if locator.count() > 0:
+                    btn_aceptar = locator
+                    break
+            except:
+                pass
+
+    if btn_aceptar:
+        try:
+            txt = btn_aceptar.inner_text().strip()
+            print(f"   🖱 Pulsando botón principal: '{txt}'...")
+        except:
+            txt = "Accept Invitation"
+            print(f"   🖱 Pulsando botón principal...")
+            
+        try:
+            btn_aceptar.click(force=True, timeout=3000)
+        except:
+            try:
+                btn_aceptar.dispatch_event("click")
+            except Exception as e:
+                print(f"   ⚠ Falló click en botón principal: {e}")
+                
+        # Esperar a que se procese el clic y pueda aparecer el modal (hasta 3.0 segundos)
+        print(f"   ⏳ Esperando confirmación del modal...")
+        time.sleep(2.5)
+        
+        # 2. Buscar y pulsar el modal "Join Family"
+        print(f"   🔍 Comprobando si aparece el modal de confirmación ('Join Family')...")
+        btn_join = None
+        
+        # Patrones para el botón del modal (excluyendo aceptar/accept para no confundirse con el botón de fondo)
+        patrones_modal = [
+            r"join\s+family",
+            r"unirse\s+al\s+plan",
+            r"unirse",
+            r"[úu]nete\s+al\s+plan\s+family",
+            r"[úu]nete\s+al\s+plan",
+            r"[úu]nete",
+        ]
+        
+        for frame in frames_visibles(page):
+            # Método A: get_by_role (button o link)
+            for t in patrones_modal:
+                try:
+                    for role in ["button", "link"]:
+                        locator = frame.get_by_role(role, name=re.compile(t, re.I))
+                        if locator.count() > 0:
+                            btn_join = locator.first
+                            break
+                    if btn_join:
+                        break
+                except:
+                    pass
+            if btn_join:
+                break
+                
+            # Método B: get_by_text
+            if not btn_join:
+                for t in patrones_modal:
+                    try:
+                        locator = frame.get_by_text(re.compile(t, re.I))
+                        if locator.count() > 0:
+                            btn_join = locator.first
+                            break
+                    except:
+                        pass
+                if btn_join:
+                    break
+
+        if btn_join:
+            try:
+                txt_join = btn_join.inner_text().strip()
+                print(f"   📋 [Modal Detectado] Confirmando unión al plan familiar...")
+                print(f"   🖱 Pulsando botón del modal: '{txt_join}'...")
+            except:
+                print(f"   📋 [Modal Detectado] Confirmando unión al plan familiar...")
+                
+            try:
+                btn_join.click(force=True, timeout=3000)
+            except:
+                try:
+                    btn_join.dispatch_event("click")
+                except Exception as e:
+                    print(f"   ⚠ Error al hacer clic en botón de modal: {e}")
+        else:
+            # Método C: Clic por JS directo en el frame para buscar y pulsar el botón del modal
+            try:
+                modal_confirmado = page.evaluate("""
+                    () => {
+                        const targets = ['join family', 'unirse al plan', 'unirse', 'únete al plan family', 'unete al plan family', 'únete al plan', 'unete al plan', 'únete', 'unete'];
+                        const elems = document.querySelectorAll('button, a, div, span');
+                        for (const el of elems) {
+                            const txt = el.textContent.toLowerCase().trim();
+                            for (const target of targets) {
+                                if (txt === target || (txt.includes(target) && txt.length < 25)) {
+                                    try { el.click(); return true; } catch(e) {}
+                                    try {
+                                        const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                                        el.dispatchEvent(ev);
+                                        return true;
+                                    } catch(e) {}
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                """)
+                if modal_confirmado:
+                    print(f"   📋 [Modal Confirmado vía JS] Clic en el botón del modal exitoso")
+            except:
+                pass
+                
+        time.sleep(2.5)
+        return True
+    else:
+        # Si no encontró el botón principal, tal vez el modal ya estaba abierto o ya se unió.
+        # Hacemos una comprobación de seguridad por JS de si podemos pulsar directamente el botón del modal
+        try:
+            modal_confirmado_directo = page.evaluate("""
+                () => {
+                    const targets = ['join family', 'unirse al plan', 'unirse', 'únete al plan family', 'unete al plan family', 'únete al plan', 'unete al plan', 'únete', 'unete'];
+                    const elems = document.querySelectorAll('button, a, div, span');
+                    for (const el of elems) {
+                        const txt = el.textContent.toLowerCase().trim();
+                        for (const target of targets) {
+                            if (txt === target || (txt.includes(target) && txt.length < 25)) {
+                                try { el.click(); return true; } catch(e) {}
+                                try {
+                                    const ev = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+                                    el.dispatchEvent(ev);
+                                    return true;
+                                } catch(e) {}
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if modal_confirmado_directo:
+                print(f"   📋 [Modal Confirmado Directo] Clic en el botón del modal sin botón principal")
+                time.sleep(2.5)
+                return True
+        except:
+            pass
+            
+        print(f"   ❌ No se encontró el botón principal de invitación ('Accept Invitation')")
+        return False
+
+
+def aceptar_invitacion_tras_login(page, perfil: str = "Ventana", modo_cambio_plan: bool = False) -> bool:
+    """
+    Busca y pulsa el botón 'Accept Invitation', y si aparece el modal de cambio de plan
+    ('Join Family'), pulsa dicho botón para confirmar.
+    """
+    try:
+        exito = procesar_botones_aceptacion_y_confirmacion(page, perfil)
+        if exito:
+            # Verificar si ya sale la pantalla de confirmación
+            textos_exito = ["you're all set", "todo listo", "invitacion aceptada", "bienvenido", "welcome", "ya eres miembro", "you are now a member", "you are now a part of"]
+            try:
+                body_txt = page.locator("body").inner_text().lower()
+                if any(t in body_txt for t in textos_exito):
+                    print(f"   ✅ Invitación aceptada correctamente (Confirmado por pantalla)")
+                    return True
+            except:
+                pass
+            return True
+        else:
+            if es_invitacion_ya_aceptada(page):
+                return True
+            return False
+    except Exception as e:
+        print(f"   ❌ Error al aceptar invitación tras login: {e}")
+        return False
+
+
+def fase_3_login_y_aceptar(invitaciones: list[dict], cuentas: dict[str, str], modo_cambio_plan: bool = False) -> list[dict]:
+    """
+    Fase 3: Detecta email en página, busca contraseña correspondiente,
+    completa registro/login y acepta la invitación.
+    """
+    validas = [i for i in invitaciones if i.get("page")]
+    if not validas:
+        print("No hay ventanas abiertas para procesar.")
+        return invitaciones
+
+    print(f"\n=== FASE 3: Login/Registro y aceptación de invitaciones ===")
+    print(f"   Detectando email en cada página y completando registro si es necesario...\n")
+
+    exitosas = []
+    
+    for inv in validas:
+        page = inv["page"]
+        n = inv["n"]
+        perfil = inv["perfil"]
+
+        try:
+            print(f"\n[{n}] {perfil}: Analizando página...")
+            
+            # === DETECCIÓN RÁPIDA: Verificar éxito inmediatamente al cargar ===
+            # Esto evita esperas innecesarias para enlaces ya utilizados
+            if inv.get("exito"):
+                print(f"   📄 Invitación YA ACEPTADA detectada (precargada)")
+                print(f"   ✓ El enlace ya fue utilizado con éxito - Continuando...")
+                exitosas.append(inv)
+                continue
+                
+            # Esperar mínima carga (solo 1 segundo)
+            time.sleep(1.0)
+            
+            # Chequear y resolver bloqueos/captchas al inicio de la carga
+            chequear_y_resolver_bloqueos_pagina(page, perfil)
+            
+            # Intentar usar el email esperado parseado del archivo invitaciones.txt primero
+            email = inv.get("email_esperado")
+            if email:
+                print(f"   ✓ Email esperado para este link: {email}")
+            else:
+                email = detectar_email_en_pagina(page)
+            
+            inv["email_detectado"] = email
+            
+            # Verificación RÁPIDA de enlaces ya exitosos
+            if es_invitacion_ya_aceptada(page):
+                print(f"   📄 Invitación YA ACEPTADA detectada")
+                print(f"   ✓ El enlace ya fue utilizado con éxito - Continuando...")
+                inv["exito"] = True
+                exitosas.append(inv)
+                continue  # Saltar al siguiente inmediatamente
+            
+            if es_pagina_login_completo(page):
+                if modo_cambio_plan:
+                    # En modo cambio de plan, no omitir de inmediato ya que necesitamos iniciar sesión
+                    pass
+                else:
+                    print(f"   📄 LOGIN COMPLETO detectado (cuenta existente)")
+                    print(f"   ✓ Invitación previamente aceptada - Continuando...")
+                    inv["exito"] = True
+                    exitosas.append(inv)
+                    continue  # Saltar al siguiente inmediatamente
+            
+            # Si no es exitoso rápido, continuar con análisis completo
+            print(f"   ⏳ Esperando carga completa...")
+            try:
+                page.wait_for_selector("body", timeout=8000)
+            except:
+                pass
+            
+            time.sleep(2.0)
+            
+            # Chequear y resolver bloqueos/captchas tras carga completa
+            chequear_y_resolver_bloqueos_pagina(page, perfil)
+            
+            # Aceptar cookies inmediatamente para evitar que bloqueen los elementos
+            aceptar_cookies(page)
+            
+            # Comprobar si pide código de correo y cambiar a contraseña inmediatamente
+            if manejar_opcion_contrasena(page, perfil):
+                time.sleep(2.0)
+                chequear_y_resolver_bloqueos_pagina(page, perfil)
+                aceptar_cookies(page)
+            
+            # Verificación de enlace ya aceptado tras carga completa
+            if es_invitacion_ya_aceptada(page):
+                print(f"   📄 Invitación YA ACEPTADA detectada")
+                print(f"   ✓ El enlace ya fue utilizado con éxito - Continuando...")
+                inv["exito"] = True
+                exitosas.append(inv)
+                continue  # Saltar al siguiente inmediatamente
+            
+            # Si aún no tenemos email, intentamos detectarlo en la página
+            if not email:
+                email = detectar_email_en_pagina(page)
+                inv["email_detectado"] = email
+            
+            if email:
+                password = buscar_password_por_email(email, cuentas)
+                if not password:
+                    continue
+            else:
+                print(f"   ❌ No se pudo determinar el email para la invitación")
+                continue
+            
+            # === PASO 1: Detectar tipo de página y procesar ===
+            print(f"   🔍 Detectando tipo de página...")
+            
+            invitacion_aceptada = False
+            
+            if es_pagina_registro(page):
+                # Ya estamos en página de registro
+                print(f"   📄 Página de REGISTRO detectada")
+                print(f"   📝 Completando registro para unirse al plan familiar...")
+                registro_completado = completar_registro(page, email, password)
+                
+                # Chequear y resolver bloqueos/captchas tras intentar completar registro
+                chequear_y_resolver_bloqueos_pagina(page, perfil)
+                
+                if registro_completado:
+                    # Al completar registro (pulsar "Suscríbete"), ya se unió al plan
+                    invitacion_aceptada = True
+                    print(f"   ✓ Registro completado - Usuario unido al plan familiar ✓")
+                    time.sleep(3.0)  # Esperar confirmación final
+                else:
+                    print(f"   ⚠ Error completando registro")
+                    invitacion_aceptada = False
+            
+            elif es_pagina_login_completo(page):
+                # Estamos en login completo (campo de contraseña visible)
+                print(f"   📄 Página de LOGIN COMPLETO detectada (cuenta existe)")
+                if modo_cambio_plan:
+                    login_exitoso = realizar_login_cuenta_existente(page, email, password, perfil)
+                    if login_exitoso:
+                        invitacion_aceptada = aceptar_invitacion_tras_login(page, perfil, modo_cambio_plan)
+                else:
+                    print(f"   ✓ Invitación previamente aceptada - continuando...")
+                    invitacion_aceptada = True
+            
+            else:
+                # Estamos en página de login inicial (solo pide email)
+                print(f"   📄 Página de LOGIN INICIAL detectada (requiere continuar)")
+                
+                # Buscar y pulsar "Continuar"
+                try:
+                    btn_continuar = page.get_by_role("button", name=re.compile(r"continuar|continue", re.I)).first
+                    if btn_continuar.count() and btn_continuar.is_visible(timeout=3000):
+                        print(f"   🖱 Pulsando 'Continuar'...")
+                        btn_continuar.click(timeout=5000)
+                        # Esperar dinámicamente a que la página cambie de estado (máximo 12 segundos)
+                        print(f"   ⏳ Esperando redirección, captcha o código por correo...")
+                        for _ in range(12):
+                            # 1. Comprobar si hay captcha/bloqueo y resolverlo
+                            if detectar_antibot_tid(page) or detectar_captcha_caducado(page) or detectar_error_403_cloudfront(page):
+                                print(f"   [Antibot] Bloqueo o captcha detectado durante la espera. Resolviendo...")
+                                chequear_y_resolver_bloqueos_pagina(page, perfil)
+                                time.sleep(2.0)
+                            
+                            # 1.5 Comprobar si hay bloqueo de acceso restringido
+                            if es_bloqueo_acceso_restringido(page):
+                                print(f"   [Acceso Restringido] Bloqueo detectado tras Continuar. Reintentando por pricing...")
+                                if recuperar_de_bloqueo_restringido(page, inv["url"], perfil):
+                                    # Intentar re-pulsar "Continuar" tras recuperar la página
+                                    try:
+                                        btn_reintento = page.get_by_role("button", name=re.compile(r"continuar|continue", re.I)).first
+                                        if btn_reintento.count() and btn_reintento.is_visible(timeout=5000):
+                                            print(f"   🖱 Reintentando pulsar 'Continuar'...")
+                                            btn_reintento.click(timeout=5000)
+                                            time.sleep(1.0)
+                                    except:
+                                        pass
+                            
+                            # 2. Comprobar si pide código al correo y cambiar a contraseña
+                            if manejar_opcion_contrasena(page, perfil):
+                                time.sleep(1.5)
+                            
+                            # 3. Comprobar si ya cargó la siguiente página
+                            if es_pagina_login_completo(page) or es_pagina_registro(page) or es_invitacion_ya_aceptada(page):
+                                break
+                                
+                            time.sleep(1.0)
+                        
+                        # Comprobación de seguridad final
+                        chequear_y_resolver_bloqueos_pagina(page, perfil)
+                        
+                        # Verificar si ahora estamos en login completo (cuenta existente)
+                        if es_pagina_login_completo(page):
+                            print(f"   📄 Redirigido a LOGIN COMPLETO (cuenta ya existe)")
+                            if modo_cambio_plan:
+                                login_exitoso = realizar_login_cuenta_existente(page, email, password, perfil)
+                                if login_exitoso:
+                                    invitacion_aceptada = aceptar_invitacion_tras_login(page, perfil, modo_cambio_plan)
+                            else:
+                                print(f"   ✓ Invitación previamente aceptada - continuando...")
+                                invitacion_aceptada = True
+                        
+                        # Verificar si ahora estamos en registro (nueva cuenta)
+                        elif es_pagina_registro(page):
+                            print(f"   📄 Redirigido a REGISTRO (nueva cuenta)")
+                            print(f"   📝 Completando registro para unirse al plan...")
+                            registro_completado = completar_registro(page, email, password)
+                            
+                            if registro_completado:
+                                invitacion_aceptada = True
+                                print(f"   ✓ Registro completado - Usuario unido al plan familiar ✓")
+                                time.sleep(3.0)
+                            else:
+                                print(f"   ⚠ Error completando registro")
+                                invitacion_aceptada = False
+                        else:
+                            # Cuenta existente - buscar botón de aceptar
+                            invitacion_aceptada = procesar_botones_aceptacion_y_confirmacion(page, perfil)
+                    else:
+                        print(f"   ⚠ No se encontró botón 'Continuar'. Comprobando si estamos en pantalla de código de correo...")
+                        if manejar_opcion_contrasena(page, perfil):
+                            print(f"   ⏳ Esperando transición a login completo tras fallback...")
+                            time.sleep(2.5)
+                            chequear_y_resolver_bloqueos_pagina(page, perfil)
+                            if es_pagina_login_completo(page):
+                                print(f"   📄 Redirigido a LOGIN COMPLETO tras fallback (cuenta ya existe)")
+                                if modo_cambio_plan:
+                                    login_exitoso = realizar_login_cuenta_existente(page, email, password, perfil)
+                                    if login_exitoso:
+                                        invitacion_aceptada = aceptar_invitacion_tras_login(page, perfil, modo_cambio_plan)
+                                else:
+                                    invitacion_aceptada = True
+                except Exception as e:
+                    print(f"   ⚠ Error en login: {e}")
+            
+            # Marcar resultado
+            if invitacion_aceptada:
+                inv["exito"] = True
+                exitosas.append(inv)
+                print(f"   ✅ INVITACIÓN PROCESADA CON ÉXITO")
+            else:
+                inv["exito"] = False
+                print(f"   ❌ No se pudo procesar la invitación")
+        
+        except Exception as e:
+            print(f"[{n}] {perfil}: ❌ Error - {e}")
+
+    print(f"\n✓ Fase 3 completada: {len(exitosas)}/{len(validas)} invitaciones aceptadas")
+    return invitaciones
+
+
+def fase_4_verificacion(invitaciones: list[dict]) -> None:
+    """
+    Fase 4: Verifica que las invitaciones fueron aceptadas correctamente.
+    Muestra resumen detallado con emails aceptados y fallidos.
+    """
+    validas = [i for i in invitaciones if i.get("page")]
+    if not validas:
+        return
+
+    print(f"\n=== FASE 4: Verificación de invitaciones aceptadas ===\n")
+    
+    verificadas = 0
+    exitosas = []  # Lista de emails exitosos
+    fallidas = []  # Lista de emails fallidos
+    
+    for inv in validas:
+        page = inv["page"]
+        n = inv["n"]
+        perfil = inv["perfil"]
+        email = inv.get("email_detectado", "email_desconocido")
+        
+        try:
+            # Buscar indicadores de éxito
+            exito = False
+            
+            # Buscar textos de confirmación
+            textos_exito = [
+                re.compile(r"bienvenido", re.I),
+                re.compile(r"welcome", re.I),
+                re.compile(r"invitaci[oó]n aceptada", re.I),
+                re.compile(r"invitation accepted", re.I),
+                re.compile(r"ya eres miembro", re.I),
+                re.compile(r"you are now a member", re.I),
+                re.compile(r"you are now a part of", re.I),
+                re.compile(r"you[']re all set", re.I),
+                re.compile(r"todo listo", re.I),
+                re.compile(r"plan family", re.I),
+                re.compile(r"family plan", re.I),
+                re.compile(r"success", re.I),
+                re.compile(r"confirm", re.I),
+            ]
+            
+            for patron in textos_exito:
+                try:
+                    loc = page.get_by_text(patron).first
+                    if loc.count() and loc.is_visible(timeout=1000):
+                        exito = True
+                        break
+                except:
+                    continue
+            
+            # Verificar URL
+            try:
+                url = page.url
+                if "success" in url.lower() or "confirm" in url.lower() or "welcome" in url.lower():
+                    exito = True
+            except:
+                pass
+            
+            # También verificar si fue marcado como éxito en fase 3
+            if not exito and inv.get("exito"):
+                exito = True
+            
+            if exito:
+                inv["exito"] = True
+                exitosas.append(email)
+                print(f"[{n}] {perfil}: ✓ {email} - INVITACIÓN ACEPTADA")
+                verificadas += 1
+            else:
+                inv["exito"] = False
+                fallidas.append(email)
+                print(f"[{n}] {perfil}: ✗ {email} - FALLÓ (revisar manualmente)")
+        
+        except Exception as e:
+            fallidas.append(email)
+            print(f"[{n}] {perfil}: ✗ {email} - ERROR: {e}")
+    
+    # Resumen detallado
+    print(f"\n{'='*60}")
+    print(f"📊 RESUMEN DE INVITACIONES")
+    print(f"{'='*60}")
+    print(f"Total procesadas: {len(validas)}")
+    print(f"✅ Aceptadas: {len(exitosas)}")
+    print(f"❌ Fallidas: {len(fallidas)}")
+    
+    if exitosas:
+        print(f"\n✅ CORREOS ACEPTADOS CORRECTAMENTE:")
+        for i, email in enumerate(exitosas, 1):
+            print(f"   {i}. {email}")
+    
+    if fallidas:
+        print(f"\n❌ CORREOS QUE FALLARON:")
+        for i, email in enumerate(fallidas, 1):
+            print(f"   {i}. {email}")
+    
+    print(f"\n{'='*60}")
+    print(f"✓ Fase 4 completada: {verificadas}/{len(validas)} verificadas")
+
+
+def cerrar_navegadores_bloque(invitaciones_bloque: list[dict]) -> None:
+    """Cierra todos los navegadores de un bloque (contextos + browser compartido)."""
+    print(f"\n🔒 Cerrando {len(invitaciones_bloque)} ventana(s) del bloque...")
+    
+    # Cerrar contextos
+    contextos_cerrados = 0
+    for inv in invitaciones_bloque:
+        try:
+            if inv.get("context"):
+                inv["context"].close()
+                contextos_cerrados += 1
+        except:
+            pass
+    
+    # Cerrar browser compartido (solo una vez por bloque)
+    browser_cerrado = False
+    for inv in invitaciones_bloque:
+        try:
+            if inv.get("browser"):
+                inv["browser"].close()
+                browser_cerrado = True
+                break  # Solo cerrar el browser una vez
+        except:
+            pass
+    
+    print(f"   ✓ {contextos_cerrados} ventana(s) + Chrome cerrado(s)")
+
+
+def procesar_bloque(playwright, bloque_invitaciones: list[dict], cuentas: dict[str, str], num_bloque: int, total_bloques: int, delay_entre_aperturas: float = 0.22, espera_post_carga: float = 3.0, modo_cambio_plan: bool = False) -> tuple[int, int]:
+    """
+    Procesa un bloque de invitaciones.
+    Retorna (exitosos, total) del bloque.
+    """
+    cantidad = len(bloque_invitaciones)
+    
+    print("\n" + "=" * 60)
+    print(f"🚀 PROCESANDO BLOQUE {num_bloque} de {total_bloques} ({cantidad} invitaciones)")
+    print("=" * 60)
+    print(f"   Espera post-carga: {espera_post_carga}s | Delay entre ventanas: {delay_entre_aperturas}s")
+    print("-" * 60)
+    
+    try:
+        # === FASE 1: Crear perfiles ===
+        bloque_invitaciones = fase_1_crear_perfiles(bloque_invitaciones)
+
+        # === FASE 2: Abrir navegadores (un solo Chrome + contextos aislados) ===
+        bloque_invitaciones = fase_2_abrir_navegadores(playwright, bloque_invitaciones, delay_entre_aperturas)
+
+        if not any(i.get("page") for i in bloque_invitaciones):
+            print("\n❌ No se pudieron abrir navegadores en este bloque.")
+            return 0, cantidad
+
+        # Verificar si hay ventanas que no han sido aceptadas todavía
+        pendientes = [i for i in bloque_invitaciones if i.get("page") and not i.get("exito", False)]
+        
+        if pendientes:
+            # Espera adicional para que TODAS las páginas terminen de cargar
+            print(f"\n⏳ Esperando {espera_post_carga}s para que todas las páginas carguen completamente...")
+            time.sleep(espera_post_carga)
+            
+            # Verificar bloqueos después de abrir
+            manejar_bloqueos(bloque_invitaciones, f"Bloque {num_bloque} - tras abrir navegadores")
+        else:
+            print("\n✓ Todas las invitaciones de este bloque ya fueron detectadas como aceptadas. Omitiendo esperas iniciales.")
+
+        # === FASE 3: Login y aceptación ===
+        bloque_invitaciones = fase_3_login_y_aceptar(bloque_invitaciones, cuentas, modo_cambio_plan)
+
+        # Espera de asentamiento y segunda verificación de bloqueos (solo si procesamos alguna acción)
+        if pendientes:
+            print("\n⏳ Esperando 6.0s a que terminen de cargarse las últimas acciones en las ventanas...")
+            time.sleep(6.0)
+            
+            # Verificar bloqueos después de login
+            manejar_bloqueos(bloque_invitaciones, f"Bloque {num_bloque} - tras intentar login")
+        else:
+            print("\n✓ Omitiendo tiempo de asentamiento y bloqueos post-login (sin acciones pendientes).")
+
+        # === FASE 4: Verificación ===
+        fase_4_verificacion(bloque_invitaciones)
+
+        # Contar exitosos
+        exitosos = len([i for i in bloque_invitaciones if i.get("exito", False)])
+        
+        print(f"\n✓ Bloque {num_bloque} completado: {exitosos}/{cantidad} invitaciones aceptadas")
+        
+        # Cerrar navegadores del bloque
+        cerrar_navegadores_bloque(bloque_invitaciones)
+        
+        return exitosos, cantidad
+        
+    except Exception as e:
+        print(f"\n❌ Error en bloque {num_bloque}: {e}")
+        cerrar_navegadores_bloque(bloque_invitaciones)
+        return 0, cantidad
+
+
+def main():
+    """Función principal del aceptador de invitaciones TIDAL."""
+    print("=" * 60)
+    print("ACEPTADOR DE INVITACIONES TIDAL FAMILY")
+    print("=" * 60)
+
+    TAMANO_BLOQUE = 15
+    if sys.stdin.isatty():
+        try:
+            print("\nSelecciona el tamaño del grupo de ventanas a procesar por bloque:")
+            print("  1. Grupo de 5 ventanas")
+            print("  2. Grupo de 10 ventanas")
+            print("  3. Grupo de 15 ventanas (Predeterminado)")
+            print("  4. Grupo de 20 ventanas")
+            print("  5. Personalizado (ingresar cantidad)")
+            
+            opcion = input("Elige una opción (1-5) [3]: ").strip()
+            if opcion == "1":
+                TAMANO_BLOQUE = 5
+            elif opcion == "2":
+                TAMANO_BLOQUE = 10
+            elif opcion == "4":
+                TAMANO_BLOQUE = 20
+            elif opcion == "5":
+                cant = input("Ingresa la cantidad de ventanas por bloque: ").strip()
+                TAMANO_BLOQUE = int(cant) if cant.isdigit() and int(cant) > 0 else 15
+            else:
+                TAMANO_BLOQUE = 15
+        except Exception:
+            TAMANO_BLOQUE = 15
+    else:
+        print("\n(Sin TTY: usando tamaño de bloque predeterminado de 15)")
+
+    # Opción: Cambio de Plan Familiar
+    MODO_CAMBIO_PLAN = False
+    if sys.stdin.isatty():
+        try:
+            print("\n¿Deseas activar el modo 'Cambio de Plan Familiar'?")
+            print("  (Útil si las cuentas ya existen y se están moviendo a un nuevo plan familiar)")
+            print("  1. Sí (Iniciar sesión en cuentas existentes y aceptar la nueva invitación)")
+            print("  2. No (Aceptación estándar para nuevas cuentas - Predeterminado)")
+            opt = input("Elige una opción (1-2) [2]: ").strip()
+            if opt == "1":
+                MODO_CAMBIO_PLAN = True
+                print("   ➔ Modo 'Cambio de Plan Familiar' ACTIVADO.")
+            else:
+                print("   ➔ Modo estándar activado.")
+        except Exception:
+            pass
+
+    print(f"\n📦 Configuración: Bloques de {TAMANO_BLOQUE} invitaciones | Cambio de Plan: {'Sí' if MODO_CAMBIO_PLAN else 'No'}")
+    print("   (Los links deben aceptarse rápido antes de que expiren)")
+    print("\n⚠ IMPORTANTE:")
+    print("   Cada invitación se procesa en un perfil de Chrome COMPLETAMENTE SEPARADO")
+    print("   No se puede aceptar 2 invitaciones en el mismo perfil\n")
+
+    # Verificar archivos requeridos
+    if not DEFAULT_INVITACIONES_FILE.is_file():
+        print(f"\nCreando archivo invitaciones.txt en: {DEFAULT_INVITACIONES_FILE}")
+        DEFAULT_INVITACIONES_FILE.write_text(
+            "# Agrega aquí los links de invitación TIDAL Family y su correo debajo\n"
+            "# Ejemplo:\n"
+            "# 1. https://tidal.com/family/invite/abc123\n"
+            "#    correo: usuario@gmail.com\n",
+            encoding="utf-8",
+        )
+        print("Edita invitaciones.txt y agrega los links para continuar.")
+        return
+
+    if not DEFAULT_CUENTAS_FILE.is_file():
+        print(f"\nCreando archivo cuentastidal.txt en: {DEFAULT_CUENTAS_FILE}")
+        DEFAULT_CUENTAS_FILE.write_text(
+            "# Agrega aquí el correo y la contraseña separados por un espacio o tabulador, uno por línea\n"
+            "# Ejemplo: usuario@gmail.com contrasena123\n",
+            encoding="utf-8",
+        )
+        print("Edita cuentastidal.txt y agrega las cuentas para continuar.")
+        return
+
+    # Leer datos
+    todas_invitaciones = leer_invitaciones()
+    if not todas_invitaciones:
+        print("No se encontraron invitaciones válidas en invitaciones.txt")
+        sys.exit(1)
+
+    cuentas = leer_cuentas()
+    if not cuentas:
+        print("No se encontraron cuentas válidas en cuentastidal.txt")
+        sys.exit(1)
+
+    total_invitaciones = len(todas_invitaciones)
+    
+    print(f"\n📊 RESUMEN:")
+    print(f"   Total invitaciones: {total_invitaciones}")
+    print(f"   Total cuentas disponibles: {len(cuentas)}")
+    print(f"   Tamaño de bloque: {TAMANO_BLOQUE}")
+    
+    # Calcular número de bloques
+    num_bloques = (total_invitaciones + TAMANO_BLOQUE - 1) // TAMANO_BLOQUE
+    print(f"   Número de bloques a procesar: {num_bloques}")
+
+    # Validar si faltan cuentas para las invitaciones parseadas
+    cuentas_faltantes = 0
+    for inv in todas_invitaciones:
+        email = inv.get("email_esperado")
+        if email and email.lower().strip() not in cuentas:
+            cuentas_faltantes += 1
+    
+    if cuentas_faltantes > 0:
+        print(f"\n⚠ Aviso: faltan contraseñas para {cuentas_faltantes} correos de las invitaciones en cuentastidal.txt.")
+
+    # Confirmar inicio
+    print("\n" + "=" * 60)
+    input("Presiona ENTER para comenzar el procesamiento por bloques...")
+    print("=" * 60)
+
+    # Procesar por bloques
+    total_exitosos = 0
+    
+    with sync_playwright() as playwright:
+        try:
+            for i in range(num_bloques):
+                # Calcular índices del bloque actual
+                inicio = i * TAMANO_BLOQUE
+                fin = min(inicio + TAMANO_BLOQUE, total_invitaciones)
+                
+                # Obtener bloque actual
+                bloque = todas_invitaciones[inicio:fin]
+                
+                # Actualizar números de invitación en el bloque
+                for idx, inv in enumerate(bloque):
+                    inv["n"] = inicio + idx + 1
+                    inv["perfil"] = f"Perfil_{inv['n']}"
+                
+                print(f"\n\n{'='*60}")
+                print(f"BLOQUE {i + 1} de {num_bloques} (invitaciones {inicio + 1} - {fin})")
+                print(f"{'='*60}")
+                
+                # Procesar bloque (con delay entre aperturas y espera post-carga)
+                exitosos_bloque, cantidad_bloque = procesar_bloque(
+                    playwright, bloque, cuentas, i + 1, num_bloques,
+                    delay_entre_aperturas=0.5,  # Aumentado para dar más tiempo
+                    espera_post_carga=4.0,       # Espera adicional después de cargar
+                    modo_cambio_plan=MODO_CAMBIO_PLAN
+                )
+                
+                total_exitosos += exitosos_bloque
+                
+                # Pausa entre bloques (excepto después del último)
+                if i < num_bloques - 1:
+                    print(f"\n{'='*60}")
+                    print(f"⏸ BLOQUE {i + 1} COMPLETADO")
+                    print(f"   Progreso: {total_exitosos}/{fin} invitaciones procesadas")
+                    print(f"\n   Esperando 4 segundos antes de continuar con el siguiente bloque automáticamente...")
+                    print(f"{'='*60}")
+                    time.sleep(4.0)
+            
+            # Resumen final
+            print("\n\n" + "=" * 60)
+            print("🎉 ¡PROCESO COMPLETADO!")
+            print("=" * 60)
+            print(f"\n📈 RESUMEN FINAL:")
+            print(f"   Total invitaciones: {total_invitaciones}")
+            print(f"   Aceptadas exitosamente: {total_exitosos}")
+            print(f"   Fallidas: {total_invitaciones - total_exitosos}")
+            print(f"   Tasa de éxito: {(total_exitosos/total_invitaciones)*100:.1f}%")
+            print(f"\n📁 Perfiles guardados en: {PROFILES_DIR}")
+            print("   Cada perfil está aislado y puede reutilizarse.")
+            print("\n⚠ Los links de invitación tienen tiempo limitado.")
+            print("   Si alguna falló, verifica que el link no haya expirado.")
+
+        except KeyboardInterrupt:
+            print("\n\n⚠ Script interrumpido por el usuario.")
+        except Exception as e:
+            print(f"\n\n❌ Error inesperado: {e}")
+
+
+if __name__ == "__main__":
+    main()
